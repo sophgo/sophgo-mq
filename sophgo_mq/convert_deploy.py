@@ -383,6 +383,9 @@ def deploy_qparams_sophgo_tpu(model: GraphModule, onnx_model_path, model_name, q
     logger.info("Extract qparams for sophgo_tpu.")
     cali_mode = "sophgo_tpu"
     global model_onnx_mem
+    export_to_mem = 'not_gen_bmodel' in kwargs and kwargs['not_gen_bmodel']
+    if not export_to_mem:
+        model_onnx_mem = None
     model_onnx_mem = remove_fakequantize_and_collect_params_sophgo(onnx_model_path, model_name, quant_type_dict, model_onnx_mem)
     # print("导出calitable")
     output_path = osp.dirname(onnx_model_path)
@@ -541,8 +544,8 @@ def convert_deploy(model: GraphModule, net_type='CNN',
         test_reference = os.path.join(output_path, 'layer_outputs_0.npz')
         quantize_table = ''
         not_gen_bmodel = ''
-        test_input, test_reference = '', ''
         if export_to_mm:
+            test_input, test_reference = '', ''
             not_gen_bmodel = '--not_gen_bmodel'
         else:
             test_input = f'--test_input {test_input}'

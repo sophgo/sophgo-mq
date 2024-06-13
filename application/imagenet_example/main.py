@@ -643,10 +643,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, val_loader):
         top5.update(acc5[0], batch_size)
         if args.use_tpu_mlir_fwd:
             step = int(batch_size / processes_num)
-            mlir_model_path = convert_deploy(model.eval(), args.chip, val_loader, 'CNN', input_shape_dict=
+            mlir_model_path = convert_deploy(model.eval(), 'CNN', input_shape_dict=
                 {'data': [step, 3, 224, 224]},
                 model_name='{}'.format(args.arch),
-                output_path=args.output_path, bf16_mix_prec = args.bf16_mix_prec, not_gen_bmodel = True)
+                output_path=args.output_path, bf16_mix_prec = args.bf16_mix_prec, not_gen_bmodel = True,
+                deploy = True, val_loader = val_loader, chip = args.chip)
             target = target.cpu()
             processes = []
             images = images.cpu().numpy()
@@ -692,7 +693,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, val_loader):
         #         print(param[0], 'has Nan', param[1].shape, 'sum:', sum)
 
         if args.fast_test:
-            if i % 64 == 0:
+            if idx % 32 == 0:
                 break
 
 def validate(val_loader, model, criterion, args):
