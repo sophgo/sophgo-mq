@@ -1,5 +1,6 @@
 import torch.nn.qat.modules as nnqat
 import torch.nn as nn
+# import torch
 
 from sophgo_mq.quantization.default_bias_fake_quant import bias_fake_quantizer
 
@@ -19,6 +20,7 @@ class Conv2d_sophgo(nnqat.Conv2d):
         scale = scale_w*in_scale
         bias_q = bias/scale
         bias = (bias_q.round()-bias_q).detach() + bias_q
+        # bias_q = torch.clamp(bias_q, -2147483648, 2147483647)
         bias = bias*scale
         return bias
 

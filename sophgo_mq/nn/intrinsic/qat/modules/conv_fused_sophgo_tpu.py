@@ -131,6 +131,7 @@ class _ConvBnNd(nn.modules.conv._ConvNd, _FusedModule):
             print('error! scale has 0, scale:', scale)
         bias_q = bias/scale
         bias = (bias_q.round()-bias_q).detach() + bias_q
+        # bias_q = torch.clamp(bias_q, -2147483648, 2147483647)
         bias = bias*scale
         return bias
 

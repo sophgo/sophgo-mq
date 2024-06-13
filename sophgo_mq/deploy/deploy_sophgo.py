@@ -139,10 +139,10 @@ class LinearQuantizer_process(object):
             new_data = np.array(new_data)
             if transposed:
                 new_data = new_data.transpose(1, 0, 2, 3)
-            logger.info(f'Clip weights <{tensor_name}> to per-channel ranges.')
+            # logger.info(f'Clip weights <{tensor_name}> to per-channel ranges.')
         else:
             new_data = np.clip(data, clip_range_min, clip_range_max)
-            logger.info(f'Clip weights <{tensor_name}> to range [{clip_range_min}, {clip_range_max}].')
+            # logger.info(f'Clip weights <{tensor_name}> to range [{clip_range_min}, {clip_range_max}].')
         new_data = numpy_helper.from_array(new_data)
         named_initializer[tensor_name].raw_data = new_data.raw_data
     
@@ -253,8 +253,8 @@ class LinearQuantizer_process(object):
             graph.node.remove(node)
         return
 
-    def remove_fakequantize_and_collect_params(self, onnx_path, model_name, quant_type_dict):
-        model = onnx.load(onnx_path)
+    def remove_fakequantize_and_collect_params(self, onnx_path, model_name, quant_type_dict, model_onnx_mem):
+        model = onnx.load(onnx_path) if model_onnx_mem is None else model_onnx_mem
         graph = model.graph
         out2node, inp2node = update_inp2node_out2node(graph)
         name2data = prepare_data(graph)
@@ -275,7 +275,8 @@ class LinearQuantizer_process(object):
         
 
         for node in graph.node:
-            print(f'process node:{node.name}, type:{node.op_type}')
+            if model_onnx_mem is None:
+                print(f'process node:{node.name}, type:{node.op_type}')
             if node.op_type in ALL_FAKEQUANTIZER:
                 nodes_to_be_removed.append(node)
                 nodes_to_be_removed.extend(get_constant_inputs(node, out2node))
@@ -383,12 +384,13 @@ class LinearQuantizer_process(object):
             pre_op_is_cast = False
 
         ### show relation between tensor name in clip_ranges with fake quant node name
-        print(">>>>> print tensor name to node name dict")
-        for key,subdict in tensor_name_to_node_name.items():
-            print(key," : ", list(subdict.keys()))
-            print("input is :", list(subdict.values()))
-            print("\n")
-        print(">>>>> end")
+        if model_onnx_mem is None:
+            print(">>>>> print tensor name to node name dict")
+            for key,subdict in tensor_name_to_node_name.items():
+                print(key," : ", list(subdict.keys()))
+                print("input is :", list(subdict.values()))
+                print("\n")
+            print(">>>>> end")
  
 
         for node in nodes_to_be_removed:
@@ -409,10 +411,14 @@ class LinearQuantizer_process(object):
         context_filename = os.path.join(output_path, '{}_clip_ranges.json'.format(model_name))
         with open(context_filename, 'w') as f:
             json.dump(context, f, indent=4)
-        onnx_filename = os.path.join(output_path, '{}_deploy_model.onnx'.format(model_name))
         model_onnx = onnx.shape_inference.infer_shapes(model)
-        os.system(f"rm -f {onnx_filename}")
-        onnx.save(model_onnx, onnx_filename)
         logger.info("Finish deploy process.")
+        if model_onnx_mem is None:
+            onnx_filename = os.path.join(output_path, '{}_deploy_model.onnx'.format(model_name))
+            os.system(f"rm -f {onnx_filename}")
+            onnx.save(model_onnx, onnx_filename)
+            return None
+        else:
+            return model_onnx
 
 remove_fakequantize_and_collect_params_sophgo = LinearQuantizer_process().remove_fakequantize_and_collect_params

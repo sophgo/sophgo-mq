@@ -14,6 +14,8 @@ import numpy as np
 import copy
 
 import torch
+import gc
+import multiprocessing
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -100,11 +102,13 @@ parser.add_argument('--fast_test', action='store_true')
 parser.add_argument('--cpu', action='store_true')
 parser.add_argument('--pre_eval_and_export', action='store_true')
 parser.add_argument('--deploy_batch_size', default=1, type=int, help='deploy_batch_size.')
+parser.add_argument('--mlir_infer_proccess_num', default=16, type=int, help='proccess_num for mlir_infer.')
 parser.add_argument('--fp8_e4m3', action='store_true')
 parser.add_argument('--fp8_e5m2', action='store_true')
 parser.add_argument('--bf16_mix_prec', action='store_true')
 parser.add_argument('--export_onnx_before_training', action='store_true')
 parser.add_argument('--print_freq', default=5, type=int, help='print_freq')
+parser.add_argument('--use_tpu_mlir_fwd', action='store_true')
 
 best_acc1 = 0
 
@@ -181,7 +185,7 @@ def gen_test_ref_data(cali_loader, model, args):
 
     hook_handles = []
     input_data = {}
-    data_num = 3
+    data_num = 1
     for name, child in model.named_modules():
         hd = child.register_forward_hook(hook=hook)
         hook_handles.append(hd)
@@ -468,7 +472,7 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, val_loader)
 
         # evaluate on validation set
         if epoch == args.epochs - 1:
@@ -515,7 +519,7 @@ def prepare_dataloader(args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
-    cali_num = 200
+    cali_num = args.deploy_batch_size*20
     assert cali_num % args.deploy_batch_size == 0
     cali_dataset = torch.utils.data.Subset(train_dataset, indices=torch.arange(cali_num))
     cali_loader = torch.utils.data.DataLoader(cali_dataset, batch_size=args.deploy_batch_size, shuffle=False,
@@ -591,24 +595,37 @@ def get_node_input_by_module_name(qname, model):
         return scale_name[:len(scale_name)-len(post_str)]
     else:
         return ''
+def mlir_infer(i, inputs, mlir_model_path, dic):
+    output = mlir_inference(inputs, mlir_model_path, dump_all = False, mute = True)
+    dic[f'output{i}'] = list(output.values())[0]
+    return
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, val_loader):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
+    meters = [batch_time, data_time, losses, top1, top5]
+    if args.use_tpu_mlir_fwd:
+        loss2es = AverageMeter('Loss2', ':.4e')
+        top1_2 = AverageMeter('Acc@1_2', ':6.2f')
+        top5_2 = AverageMeter('Acc@5_2', ':6.2f')
+        meters = [batch_time, data_time, losses, loss2es, top1, top5, top1_2, top5_2]
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        meters,
         prefix="Epoch: [{}]".format(epoch))
-
+    dic = multiprocessing.Manager().dict()
     # switch to train mode
     model.train()
-
+    inputs = {}
+    mlir_model_path = None
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    processes_num = args.mlir_infer_proccess_num
+    for idx, (images, target) in enumerate(train_loader):
         # measure data loading time
+        batch_size = images.size(0)
         data_time.update(time.time() - end)
 
         if args.cuda is not None and torch.cuda.is_available():
@@ -621,9 +638,40 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        losses.update(loss.item(), batch_size)
+        top1.update(acc1[0], batch_size)
+        top5.update(acc5[0], batch_size)
+        if args.use_tpu_mlir_fwd:
+            step = int(batch_size / processes_num)
+            mlir_model_path = convert_deploy(model.eval(), args.chip, val_loader, 'CNN', input_shape_dict=
+                {'data': [step, 3, 224, 224]},
+                model_name='{}'.format(args.arch),
+                output_path=args.output_path, bf16_mix_prec = args.bf16_mix_prec, not_gen_bmodel = True)
+            target = target.cpu()
+            processes = []
+            images = images.cpu().numpy()
+            for i in range(processes_num):
+                inputs['data'] = copy.deepcopy(images[i*step:(i+1)*step])
+                p = multiprocessing.Process(target=mlir_infer, 
+                                            args=(i, inputs, mlir_model_path, dic))
+                processes.append(p)
+                p.start()
+            for j in processes:
+                j.join()
+            total_loss, total_acc1_2, total_acc5_2 = 0,0,0
+            for i in range(processes_num):
+                target2 = target[i*step:(i+1)*step]
+                output = torch.from_numpy(dic[f'output{i}'])
+                total_loss += criterion(output, target2).item()
+                acc1_2, acc5_2 = accuracy(output, target2, topk=(1, 5))
+                total_acc1_2 += acc1_2[0]
+                total_acc5_2 += acc5_2[0]
+            loss2es.update(total_loss, batch_size)
+            loss.data.copy_(total_loss)
+            top1_2.update(total_acc1_2/processes_num, batch_size)
+            top5_2.update(total_acc5_2/processes_num, batch_size)
+            gc.collect()
+            model.train()
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -634,8 +682,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
+        if idx % args.print_freq == 0:
+            progress.display(idx)
 
         # # 检查训练过程参数是否异常
         # for param in model.named_parameters():
