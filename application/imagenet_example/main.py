@@ -30,13 +30,11 @@ import torchvision.models as models
 from sophgo_mq.convert_deploy import convert_deploy, convert_onnx, export_onnx_with_fakequant_node
 from sophgo_mq.prepare_by_platform import prepare_by_platform
 from sophgo_mq.utils.state import enable_calibration, enable_quantization, disable_all
-import tpu_mlir
 from tools.model_runner import mlir_inference
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
-
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('--train_data', metavar='DIR',
@@ -102,7 +100,7 @@ parser.add_argument('--fast_test', action='store_true')
 parser.add_argument('--cpu', action='store_true')
 parser.add_argument('--pre_eval_and_export', action='store_true')
 parser.add_argument('--deploy_batch_size', default=1, type=int, help='deploy_batch_size.')
-parser.add_argument('--mlir_infer_proccess_num', default=16, type=int, help='proccess_num for mlir_infer.')
+parser.add_argument('--mlir_infer_process_num', default=16, type=int, help='process_num for mlir_infer.')
 parser.add_argument('--fp8_e4m3', action='store_true')
 parser.add_argument('--fp8_e5m2', action='store_true')
 parser.add_argument('--bf16_mix_prec', action='store_true')
@@ -170,7 +168,6 @@ def generate_random_string(length):
     return ''.join(random.choices(chars, k=length))
 
 features_out_hook = {}
-
 def hook(module, fea_in, fea_out):
     name = generate_random_string(15)
     global features_out_hook
@@ -182,10 +179,11 @@ def hook(module, fea_in, fea_out):
 
 def gen_test_ref_data(cali_loader, model, args):
     model.eval()
-
     hook_handles = []
     input_data = {}
     data_num = 1
+    if args.fast_test:
+        data_num = 1
     for name, child in model.named_modules():
         hd = child.register_forward_hook(hook=hook)
         hook_handles.append(hd)
@@ -198,7 +196,6 @@ def gen_test_ref_data(cali_loader, model, args):
             else:
                 images = images.cuda(args.cuda, non_blocking=True)
             output = model(images)
-
             if i < data_num:
                 print("gen_test_ref_data ==> ", i)
                 input_data['data'] = images.cpu().numpy()
@@ -351,7 +348,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                         'wobserver': 'MinMaxObserver',
                                         }
                                     }
-        model = prepare_by_platform(model, input_shape_dict = {'data': [args.deploy_batch_size, 3, 224, 224]}, prepare_custom_config_dict=extra_prepare_dict)
+        model = prepare_by_platform(model, input_shape_dict = {'data': [args.batch_size, 3, 224, 224]}, prepare_custom_config_dict=extra_prepare_dict)
         print('>>>>>prepared module:', model)
 
     if not torch.cuda.is_available():
@@ -462,8 +459,6 @@ def main_worker(gpu, ngpus_per_node, args):
                 model_name='{}'.format(args.arch), output_path=args.output_path, deploy=True, chip=args.chip, val_loader=val_loader)
         exit(0)
 
-
-
     if args.fast_test:
         args.epochs = 1
     for epoch in range(args.start_epoch, args.epochs):
@@ -485,11 +480,17 @@ def main_worker(gpu, ngpus_per_node, args):
     enable_quantization(model)
 
     net_type = 'CNN'
+    print('>>>>>>Generate a model for accuracy testing:')
+    mlir_model_path = convert_deploy(model.eval(), net_type, input_shape_dict=
+        {'data': [args.batch_size, 3, 224, 224]},
+        model_name='{}'.format(args.arch), not_gen_bmodel = True,
+        output_path=args.output_path, bf16_mix_prec = args.bf16_mix_prec, deploy=True, chip=args.chip, val_loader=val_loader)
+    validate_for_chip_model(bmodel_test_loader, mlir_model_path, criterion, args)
+    print('>>>>>>Generate the model for final deployment on the chip:')
     mlir_model_path = convert_deploy(model.eval(), net_type, input_shape_dict=
         {'data': [args.deploy_batch_size, 3, 224, 224]},
         model_name='{}'.format(args.arch),
         output_path=args.output_path, bf16_mix_prec = args.bf16_mix_prec, deploy=True, chip=args.chip, val_loader=val_loader)
-    validate_for_chip_model(bmodel_test_loader, mlir_model_path, criterion, args)
 
 def prepare_dataloader(args):
     traindir = os.path.join(args.train_data, 'train')
@@ -518,14 +519,13 @@ def prepare_dataloader(args):
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
-    cali_num = args.deploy_batch_size*20
-    assert cali_num % args.deploy_batch_size == 0
+    
+    cali_num = (2000//args.batch_size)*args.batch_size
     cali_dataset = torch.utils.data.Subset(train_dataset, indices=torch.arange(cali_num))
-    cali_loader = torch.utils.data.DataLoader(cali_dataset, batch_size=args.deploy_batch_size, shuffle=False,
+    cali_loader = torch.utils.data.DataLoader(cali_dataset, batch_size=args.batch_size, shuffle=False,
                                                 num_workers=args.workers, pin_memory=True)
 
-    bmodel_test_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.deploy_batch_size, shuffle=False,
+    bmodel_test_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                                                 num_workers=args.workers, pin_memory=True)
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
@@ -595,6 +595,7 @@ def get_node_input_by_module_name(qname, model):
         return scale_name[:len(scale_name)-len(post_str)]
     else:
         return ''
+    
 def mlir_infer(i, inputs, mlir_model_path, dic):
     output = mlir_inference(inputs, mlir_model_path, dump_all = False, mute = True)
     dic[f'output{i}'] = list(output.values())[0]
@@ -622,7 +623,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, val_loader):
     inputs = {}
     mlir_model_path = None
     end = time.time()
-    processes_num = args.mlir_infer_proccess_num
+    processes_num = args.mlir_infer_process_num
     for idx, (images, target) in enumerate(train_loader):
         # measure data loading time
         batch_size = images.size(0)
@@ -635,12 +636,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args, val_loader):
         # compute output
         output = model(images)
         loss = criterion(output, target)
-
-        # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), batch_size)
         top1.update(acc1[0], batch_size)
         top5.update(acc5[0], batch_size)
+        
         if args.use_tpu_mlir_fwd:
             step = int(batch_size / processes_num)
             mlir_model_path = convert_deploy(model.eval(), 'CNN', input_shape_dict=
@@ -708,9 +708,6 @@ def validate(val_loader, model, criterion, args):
     print('args.print_freq:', args.print_freq)
     # switch to evaluate mode
     model.eval()
-
-
-
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
@@ -747,6 +744,7 @@ def validate(val_loader, model, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
             .format(top1=top1, top5=top5))
+
     return top1.avg
 
 
@@ -787,12 +785,12 @@ def validate_for_chip_model(bmodel_test_loader, mlir_model_path, criterion, args
         if i % args.print_freq == 0:
             progress.display(i)
 
-        # if args.fast_test:
-        #     if i % 100 == 0:
-        #         break
+        if args.fast_test:
+            if i % 3 == 0:
+                break
 
     # TODO: this should also be done with the ProgressMeter
-    print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+    print('>>>>>>the deployment accuracy of the model on the chip is: Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
         .format(top1=top1, top5=top5))
 
     return top1.avg
@@ -846,9 +844,9 @@ def validate_onnx(criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-            # if args.fast_test:
-            #     if i % 100 == 0:
-            #         break
+            if args.fast_test:
+                if i % 10 == 0:
+                    break
 
         # TODO: this should also be done with the ProgressMeter
         print('deploy_model.onnx完成所有处理后的onnxruntime测试精度:')
